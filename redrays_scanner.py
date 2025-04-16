@@ -644,17 +644,21 @@ def check_threshold_breach(vulnerabilities: List[Dict[str, Any]], threshold: str
 
 def extract_all_vulnerabilities(scan_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Extract all vulnerabilities from scan results
+    Extract all vulnerabilities from scan results, excluding those with "Unknown" risk
 
     Args:
         scan_results: List of scan results
 
     Returns:
-        List of all vulnerabilities
+        List of all vulnerabilities except those with Unknown risk
     """
     all_vulnerabilities = []
 
     for result in scan_results:
+        # Skip API errors, don't count them as vulnerabilities
+        if result.get("is_api_error", False):
+            continue
+
         vulnerabilities = result.get("vulnerabilities", [])
         if not vulnerabilities and "scan_result" in result:
             if isinstance(result["scan_result"], str):
@@ -666,7 +670,16 @@ def extract_all_vulnerabilities(scan_results: List[Dict[str, Any]]) -> List[Dict
             elif isinstance(result["scan_result"], list):
                 vulnerabilities = result["scan_result"]
 
-        all_vulnerabilities.extend(vulnerabilities)
+        # Filter out vulnerabilities with "Unknown" risk
+        filtered_vulnerabilities = []
+        for vuln in vulnerabilities:
+            if isinstance(vuln, dict) and vuln.get("severity", "").lower() != "unknown":
+                filtered_vulnerabilities.append(vuln)
+            # For non-dict vulnerabilities, we'll still include them as they don't have a standard severity
+            elif not isinstance(vuln, dict):
+                filtered_vulnerabilities.append(vuln)
+
+        all_vulnerabilities.extend(filtered_vulnerabilities)
 
     return all_vulnerabilities
 
