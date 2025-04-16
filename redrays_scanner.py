@@ -302,10 +302,19 @@ class ReportGenerator:
         """
         # Prepare data for HTML
         all_vulnerabilities = []
+        api_errors = []
 
         for result in scan_results:
             file_path = result.get("file_path", "Unknown")
             scan_guid = result.get("scan_guid", "")
+
+            # Handle API errors separately
+            if result.get("is_api_error", False):
+                api_errors.append({
+                    "file_path": file_path,
+                    "error_message": result.get("error_message", "Unknown error")
+                })
+                continue
 
             # Get vulnerabilities from scan_result
             vulnerabilities = result.get("vulnerabilities", [])
@@ -324,9 +333,12 @@ class ReportGenerator:
             # Add vulnerabilities to the master list
             for vuln in vulnerabilities:
                 vuln_data = {}
-                if vuln.get("severity", "Unknown") == "Unknown":
-                    continue
+
                 if isinstance(vuln, dict):
+                    # Skip "Unknown" severity vulnerabilities if they're dictionaries
+                    if vuln.get("severity", "Unknown").lower() == "unknown":
+                        continue
+
                     # Handle dictionary objects
                     vuln_data = {
                         "file_path": file_path,
@@ -338,16 +350,20 @@ class ReportGenerator:
                         "dataflow": vuln.get("dataflow_of_vulnerable_parameter", "")
                     }
                 else:
-                    # Handle string or other non-dictionary values
-                    vuln_data = {
-                        "file_path": file_path,
-                        "scan_guid": scan_guid,
-                        "title": "Unknown Issue",
-                        "severity": "Unknown",
-                        "description": str(vuln) if vuln else "",
-                        "about_program": "",
-                        "dataflow": ""
-                    }
+                    # Skip this case as it's likely a parsing artifact
+                    continue
+
+                    # If you want to include these, uncomment the below code:
+                    # # Handle string or other non-dictionary values
+                    # vuln_data = {
+                    #     "file_path": file_path,
+                    #     "scan_guid": scan_guid,
+                    #     "title": "Unknown Issue",
+                    #     "severity": "Unknown",
+                    #     "description": str(vuln) if vuln else "",
+                    #     "about_program": "",
+                    #     "dataflow": ""
+                    # }
 
                 all_vulnerabilities.append(vuln_data)
 
@@ -845,7 +861,7 @@ def main():
         else:
             if args.threshold:
                 pass
-                #logger.warning(
+                # logger.warning(
                 #    f"Found {vulnerability_count} vulnerabilities, but none exceed the {args.threshold} threshold. See report at: {report_path}")
             else:
                 logger.warning(f"Found {vulnerability_count} vulnerabilities. See report at: {report_path}")
