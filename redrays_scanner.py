@@ -33,7 +33,7 @@ from datetime import datetime
 from pathlib import Path
 import io
 import base64
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 
 # Configure logging
 logging.basicConfig(
@@ -111,7 +111,7 @@ class RedRaysScanner:
             payload["file_path"] = file_path
 
         try:
-            logger.info(f"Scanning file: {file_path or 'unnamed'}")
+            logger.info(f"[ScanCode] Scanning file: {file_path or 'unnamed'}")
             response = requests.post(self.api_url, json=payload, headers=self.headers)
 
             # Check for API rate limits
@@ -195,14 +195,26 @@ class ReportGenerator:
 
             # Add vulnerabilities to the master list
             for vuln in vulnerabilities:
-                all_vulnerabilities.append({
-                    "File Path": file_path,
-                    "Scan GUID": scan_guid,
-                    "Title": vuln.get("title", ""),
-                    "Severity": vuln.get("severity", "Unknown"),
-                    "Description": vuln.get("description", ""),
-                    "Program": vuln.get("about_program", "")
-                })
+                if isinstance(vuln, dict):
+                    # Handle dictionary object
+                    all_vulnerabilities.append({
+                        "File Path": file_path,
+                        "Scan GUID": scan_guid,
+                        "Title": vuln.get("title", ""),
+                        "Severity": vuln.get("severity", "Unknown"),
+                        "Description": vuln.get("description", ""),
+                        "Program": vuln.get("about_program", "")
+                    })
+                elif isinstance(vuln, str):
+                    # Handle string (might be a raw message or error)
+                    all_vulnerabilities.append({
+                        "File Path": file_path,
+                        "Scan GUID": scan_guid,
+                        "Title": "Unknown",
+                        "Severity": "Unknown",
+                        "Description": vuln,
+                        "Program": ""
+                    })
 
         # If no vulnerabilities were found
         if not all_vulnerabilities:
@@ -256,22 +268,39 @@ class ReportGenerator:
                         scan_result = json.loads(result["scan_result"])
                         vulnerabilities = scan_result if isinstance(scan_result, list) else []
                     except json.JSONDecodeError:
-                        vulnerabilities = []
+                        vulnerabilities = [result["scan_result"]]  # Use the string as a single vulnerability
                 # If scan_result is already a list
                 elif isinstance(result["scan_result"], list):
                     vulnerabilities = result["scan_result"]
 
             # Add vulnerabilities to the master list
             for vuln in vulnerabilities:
-                all_vulnerabilities.append({
-                    "file_path": file_path,
-                    "scan_guid": scan_guid,
-                    "title": vuln.get("title", ""),
-                    "severity": vuln.get("severity", "Unknown"),
-                    "description": vuln.get("description", ""),
-                    "about_program": vuln.get("about_program", ""),
-                    "dataflow": vuln.get("dataflow_of_vulnerable_parameter", "")
-                })
+                vuln_data = {}
+
+                if isinstance(vuln, dict):
+                    # Handle dictionary objects
+                    vuln_data = {
+                        "file_path": file_path,
+                        "scan_guid": scan_guid,
+                        "title": vuln.get("title", ""),
+                        "severity": vuln.get("severity", "Unknown"),
+                        "description": vuln.get("description", ""),
+                        "about_program": vuln.get("about_program", ""),
+                        "dataflow": vuln.get("dataflow_of_vulnerable_parameter", "")
+                    }
+                else:
+                    # Handle string or other non-dictionary values
+                    vuln_data = {
+                        "file_path": file_path,
+                        "scan_guid": scan_guid,
+                        "title": "Unknown Issue",
+                        "severity": "Unknown",
+                        "description": str(vuln) if vuln else "",
+                        "about_program": "",
+                        "dataflow": ""
+                    }
+
+                all_vulnerabilities.append(vuln_data)
 
         # Generate HTML
         html_content = """
@@ -582,7 +611,7 @@ def main():
                 with open(file_path, 'r', encoding='utf-8') as f:
                     code = f.read()
 
-                logger.info(f"Scanning file: {file_path}")
+                logger.info(f"[Files] Scanning file: {file_path}")
                 result = scanner.scan_code(code, file_path)
 
                 # Format the result for reporting
@@ -629,7 +658,7 @@ def main():
                 with open(file_path, 'r', encoding='utf-8') as f:
                     code = f.read()
 
-                logger.info(f"Scanning file: {file_path}")
+                logger.info(f"[ScanDir] Scanning file: {file_path}")
                 result = scanner.scan_code(code, file_path)
 
                 # Format the result for reporting
