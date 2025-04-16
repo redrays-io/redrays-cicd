@@ -18,6 +18,9 @@ Examples:
 
     # Change output format:
     python redrays_scanner.py --api-key YOUR_API_KEY --scan-dir . --output-format csv
+
+    # Set severity threshold:
+    python redrays_scanner.py --api-key YOUR_API_KEY --scan-dir . --threshold high
 """
 
 import os
@@ -47,6 +50,15 @@ logger = logging.getLogger("redrays-scanner")
 
 # Required packages
 REQUIRED_PACKAGES = ['requests']
+
+# Define severity levels with numerical values for comparison
+SEVERITY_LEVELS = {
+    "critical": 4,
+    "high": 3,
+    "medium": 2,
+    "low": 1,
+    "informational": 0
+}
 
 
 def check_dependencies():
@@ -121,14 +133,52 @@ class RedRaysScanner:
                 time.sleep(retry_after)
                 return self.scan_code(code, file_path)  # Retry the request
 
+            # Handle 400 errors more gracefully - could be due to no credits left
+            if response.status_code == 400:
+                error_message = "Bad Request"
+                try:
+                    error_data = response.json()
+                    if "message" in error_data:
+                        error_message = error_data["message"]
+                    elif "error" in error_data:
+                        error_message = error_data["error"]
+                except:
+                    pass
+
+                # Check for specific error messages about credits
+                if "credit" in error_message.lower() or "subscription" in error_message.lower():
+                    logger.error(f"API error: You do not have enough credits. Please check your RedRays subscription.")
+                else:
+                    logger.error(f"API error: {error_message}")
+
+                return {
+                    "success": False,
+                    "error": error_message,
+                    "data": None,
+                    "scan_result": [{"title": "API Error", "severity": "Unknown", "description": error_message}]
+                }
+
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:
+            error_message = str(e)
             if hasattr(e, 'response') and e.response:
-                logger.error(f"API error: {e.response.status_code} - {e.response.text}")
-            else:
-                logger.error(f"API error: {str(e)}")
-            return {"success": False, "error": str(e), "data": None}
+                try:
+                    error_data = e.response.json()
+                    if "message" in error_data:
+                        error_message = error_data["message"]
+                    elif "error" in error_data:
+                        error_message = error_data["error"]
+                except:
+                    error_message = f"{e.response.status_code} - {e.response.text}"
+
+            logger.error(f"API error: {error_message}")
+            return {
+                "success": False,
+                "error": error_message,
+                "data": None,
+                "scan_result": [{"title": "API Error", "severity": "Unknown", "description": error_message}]
+            }
 
 
 class ReportGenerator:
@@ -568,6 +618,59 @@ def find_abap_files(directory: str) -> List[str]:
     return abap_files
 
 
+def check_threshold_breach(vulnerabilities: List[Dict[str, Any]], threshold: str) -> bool:
+    """
+    Check if any vulnerability exceeds the threshold severity
+
+    Args:
+        vulnerabilities: List of vulnerabilities
+        threshold: Severity threshold (critical, high, medium, low, or informational)
+
+    Returns:
+        True if threshold is breached, False otherwise
+    """
+    if not threshold or threshold.lower() not in SEVERITY_LEVELS:
+        return False
+
+    threshold_value = SEVERITY_LEVELS[threshold.lower()]
+
+    for vuln in vulnerabilities:
+        severity = vuln.get("severity", "").lower()
+        if severity in SEVERITY_LEVELS and SEVERITY_LEVELS[severity] >= threshold_value:
+            return True
+
+    return False
+
+
+def extract_all_vulnerabilities(scan_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Extract all vulnerabilities from scan results
+
+    Args:
+        scan_results: List of scan results
+
+    Returns:
+        List of all vulnerabilities
+    """
+    all_vulnerabilities = []
+
+    for result in scan_results:
+        vulnerabilities = result.get("vulnerabilities", [])
+        if not vulnerabilities and "scan_result" in result:
+            if isinstance(result["scan_result"], str):
+                try:
+                    scan_result = json.loads(result["scan_result"])
+                    vulnerabilities = scan_result if isinstance(scan_result, list) else []
+                except json.JSONDecodeError:
+                    vulnerabilities = []
+            elif isinstance(result["scan_result"], list):
+                vulnerabilities = result["scan_result"]
+
+        all_vulnerabilities.extend(vulnerabilities)
+
+    return all_vulnerabilities
+
+
 def main():
     """Main function to run the scanner"""
     parser = argparse.ArgumentParser(description='RedRays ABAP Security Scanner')
@@ -577,6 +680,9 @@ def main():
     parser.add_argument('--scan-dir', help='Directory containing ABAP files to scan')
     parser.add_argument('--output-format', default='html', choices=['csv', 'html', 'json'], help='Report output format')
     parser.add_argument('--output-file', help='Report output file path')
+    parser.add_argument('--threshold',
+                        choices=['critical', 'high', 'medium', 'low', 'informational'],
+                        help='Severity threshold for failing the build (critical, high, medium, low, informational)')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
 
     args = parser.parse_args()
@@ -622,7 +728,7 @@ def main():
                 }
 
                 # Extract vulnerabilities from the scan result
-                if "data" in result:
+                if "data" in result and result.get("data"):
                     scan_result = result["data"].get("scan_result", [])
 
                     # If scan_result is a string (JSON), parse it
@@ -634,6 +740,10 @@ def main():
 
                     formatted_result["vulnerabilities"] = scan_result
                     formatted_result["scan_result"] = scan_result
+                elif "scan_result" in result:
+                    # For error cases where we've embedded scan_result directly
+                    formatted_result["vulnerabilities"] = result["scan_result"]
+                    formatted_result["scan_result"] = result["scan_result"]
 
                 scan_results.append(formatted_result)
 
@@ -669,7 +779,7 @@ def main():
                 }
 
                 # Extract vulnerabilities from the scan result
-                if "data" in result:
+                if "data" in result and result.get("data"):
                     scan_result = result["data"].get("scan_result", [])
 
                     # If scan_result is a string (JSON), parse it
@@ -681,6 +791,10 @@ def main():
 
                     formatted_result["vulnerabilities"] = scan_result
                     formatted_result["scan_result"] = scan_result
+                elif "scan_result" in result:
+                    # For error cases where we've embedded scan_result directly
+                    formatted_result["vulnerabilities"] = result["scan_result"]
+                    formatted_result["scan_result"] = result["scan_result"]
 
                 scan_results.append(formatted_result)
 
@@ -692,10 +806,10 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    # No files scanned
+    # No files scanned - now displays a warning instead of an error
     if not scan_results:
         logger.warning("No files were scanned. No report will be generated.")
-        sys.exit(0)
+        sys.exit(0)  # Exit with success code instead of error
 
     # Generate report
     logger.info(f"Generating {args.output_format} report: {args.output_file}")
@@ -703,16 +817,25 @@ def main():
         scan_results, args.output_format, args.output_file
     )
 
-    # Check if any vulnerabilities were found
-    vulnerability_count = 0
-    for result in scan_results:
-        if "vulnerabilities" in result:
-            vulnerability_count += len(result["vulnerabilities"])
+    # Extract all vulnerabilities for threshold checking
+    all_vulnerabilities = extract_all_vulnerabilities(scan_results)
+    vulnerability_count = len(all_vulnerabilities)
+
+    # Check if threshold is breached
+    threshold_breached = args.threshold and check_threshold_breach(all_vulnerabilities, args.threshold)
 
     if vulnerability_count > 0:
-        logger.warning(f"Found {vulnerability_count} vulnerabilities. See report at: {report_path}")
-        # Set exit code to non-zero to indicate issues were found
-        sys.exit(1)
+        if threshold_breached:
+            logger.error(
+                f"Found {vulnerability_count} vulnerabilities with {args.threshold} or higher severity. See report at: {report_path}")
+            sys.exit(1)  # Exit with error if threshold is breached
+        else:
+            if args.threshold:
+                logger.warning(
+                    f"Found {vulnerability_count} vulnerabilities, but none exceed the {args.threshold} threshold. See report at: {report_path}")
+            else:
+                logger.warning(f"Found {vulnerability_count} vulnerabilities. See report at: {report_path}")
+            sys.exit(0)  # Permit build to continue if no threshold breach
     else:
         logger.info("No vulnerabilities found in the scanned files.")
         sys.exit(0)

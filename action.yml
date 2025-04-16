@@ -29,6 +29,10 @@ inputs:
     description: 'Fail the workflow if vulnerabilities are found'
     required: false
     default: 'true'
+  threshold:
+    description: 'Severity threshold for failing the build (critical, high, medium, low, informational)'
+    required: false
+    default: ''
 
 outputs:
   report-path:
@@ -37,6 +41,9 @@ outputs:
   vulnerabilities-found:
     description: 'Number of vulnerabilities found'
     value: ${{ steps.scan.outputs.vulnerabilities-found }}
+  threshold-breached:
+    description: 'Whether the severity threshold was breached'
+    value: ${{ steps.scan.outputs.threshold-breached }}
 
 runs:
   using: 'composite'
@@ -64,6 +71,11 @@ runs:
       run: |
         # Build command based on inputs
         CMD="python redrays_scanner.py --api-key ${{ inputs.api-key }} --api-url ${{ inputs.api-url }} --output-format ${{ inputs.output-format }} --output-file ${{ inputs.output-file }} --debug"
+        
+        # Add threshold parameter if specified
+        if [ -n "${{ inputs.threshold }}" ]; then
+          CMD="$CMD --threshold ${{ inputs.threshold }}"
+        fi
         
         # Add either --scan-dir or --files depending on input
         if [ -n "${{ inputs.files }}" ]; then
@@ -95,16 +107,22 @@ runs:
           echo "vulnerabilities-found=$VULNS" >> $GITHUB_OUTPUT
           echo "Found $VULNS vulnerabilities"
           
-          # Determine if we should fail
-          if [[ "${{ inputs.fail-on-vulnerabilities }}" == "true" && $VULNS -gt 0 ]]; then
+          # Determine if we should fail based on threshold
+          if [[ "${{ inputs.threshold }}" != "" && $SCAN_EXIT_CODE -eq 0 && $VULNS -gt 0 ]]; then
+            echo "threshold-breached=false" >> $GITHUB_OUTPUT
+            echo "::warning::Vulnerabilities found but did not exceed the ${{ inputs.threshold }} threshold"
+          elif [[ $SCAN_EXIT_CODE -eq 1 ]]; then
+            echo "threshold-breached=true" >> $GITHUB_OUTPUT
+            echo "::error::Security vulnerabilities detected exceeding ${{ inputs.threshold }} threshold! See the report for details."
+            exit 1
+          elif [[ "${{ inputs.fail-on-vulnerabilities }}" == "true" && $VULNS -gt 0 ]]; then
+            echo "threshold-breached=true" >> $GITHUB_OUTPUT
             echo "::error::Security vulnerabilities detected! See the report for details."
             exit 1
-          elif [ $SCAN_EXIT_CODE -ne 0 ]; then
-            echo "::warning::Scanner completed with exit code $SCAN_EXIT_CODE"
-            exit $SCAN_EXIT_CODE
+          else
+            echo "threshold-breached=false" >> $GITHUB_OUTPUT
           fi
         else
           echo "::error::Report file not generated"
           exit 1
         fi
-        
