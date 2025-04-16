@@ -1,0 +1,110 @@
+name: 'RedRays ABAP Security Scanner'
+description: 'Scan ABAP code for security vulnerabilities using RedRays API'
+author: 'RedRays Security'
+
+inputs:
+  api-key:
+    description: 'RedRays API key (required)'
+    required: true
+  api-url:
+    description: 'RedRays API URL'
+    required: false
+    default: 'https://api.redrays.io/api/scan'
+  scan-dir:
+    description: 'Directory containing ABAP files to scan'
+    required: false
+    default: '.'
+  files:
+    description: 'Comma-separated list of specific files to scan (overrides scan-dir)'
+    required: false
+  output-format:
+    description: 'Report output format (csv, html, json)'
+    required: false
+    default: 'html'
+  output-file:
+    description: 'Report output file path'
+    required: false
+    default: 'redrays_security_report.html'
+  fail-on-vulnerabilities:
+    description: 'Fail the workflow if vulnerabilities are found'
+    required: false
+    default: 'true'
+
+outputs:
+  report-path:
+    description: 'Path to the generated security report'
+    value: ${{ steps.scan.outputs.report-path }}
+  vulnerabilities-found:
+    description: 'Number of vulnerabilities found'
+    value: ${{ steps.scan.outputs.vulnerabilities-found }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests
+
+    - name: Download RedRays ABAP Scanner
+      shell: bash
+      run: |
+        curl -o redrays_scanner.py https://raw.githubusercontent.com/redrays-io/redrays-cicd/refs/heads/master/redrays_scanner.py
+        chmod +x redrays_scanner.py
+
+    - name: Run RedRays ABAP Security Scanner
+      id: scan
+      shell: bash
+      run: |
+        # Build command based on inputs
+        CMD="python redrays_scanner.py --api-key ${{ inputs.api-key }} --api-url ${{ inputs.api-url }} --output-format ${{ inputs.output-format }} --output-file ${{ inputs.output-file }}"
+        
+        # Add either --scan-dir or --files depending on input
+        if [ -n "${{ inputs.files }}" ]; then
+          CMD="$CMD --files ${{ inputs.files }}"
+        else
+          CMD="$CMD --scan-dir ${{ inputs.scan-dir }}"
+        fi
+        
+        # Run the command and capture exit code
+        echo "Running: $CMD"
+        $CMD
+        SCAN_EXIT_CODE=$?
+        
+        # Set outputs
+        echo "report-path=${{ inputs.output-file }}" >> $GITHUB_OUTPUT
+        
+        # Check for vulnerabilities found
+        if [ -f "${{ inputs.output-file }}" ]; then
+          if [[ "${{ inputs.output-format }}" == "html" ]]; then
+            VULNS=$(grep -o "Vulnerabilities Found: [0-9]*" ${{ inputs.output-file }} | awk '{print $3}')
+          elif [[ "${{ inputs.output-format }}" == "json" ]]; then
+            VULNS=$(grep -o '"files_scanned":.*' ${{ inputs.output-file }} | awk '{print $2}' | sed 's/,//')
+          else
+            # For CSV or other formats, count lines minus header
+            VULNS=$(($(wc -l < ${{ inputs.output-file }}) - 1))
+            if [ $VULNS -lt 0 ]; then VULNS=0; fi
+          fi
+          
+          echo "vulnerabilities-found=$VULNS" >> $GITHUB_OUTPUT
+          echo "Found $VULNS vulnerabilities"
+          
+          # Determine if we should fail
+          if [[ "${{ inputs.fail-on-vulnerabilities }}" == "true" && $VULNS -gt 0 ]]; then
+            echo "::error::Security vulnerabilities detected! See the report for details."
+            exit 1
+          elif [ $SCAN_EXIT_CODE -ne 0 ]; then
+            echo "::warning::Scanner completed with exit code $SCAN_EXIT_CODE"
+            exit $SCAN_EXIT_CODE
+          fi
+        else
+          echo "::error::Report file not generated"
+          exit 1
+        fi
+        
