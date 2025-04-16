@@ -651,9 +651,12 @@ def check_threshold_breach(vulnerabilities: List[Dict[str, Any]], threshold: str
     threshold_value = SEVERITY_LEVELS[threshold.lower()]
 
     for vuln in vulnerabilities:
-        severity = vuln.get("severity", "").lower()
-        if severity in SEVERITY_LEVELS and SEVERITY_LEVELS[severity] >= threshold_value:
-            return True
+        # Handle both dictionary and string vulnerabilities
+        if isinstance(vuln, dict):
+            severity = vuln.get("severity", "").lower()
+            if severity in SEVERITY_LEVELS and SEVERITY_LEVELS[severity] >= threshold_value:
+                return True
+        # String vulnerabilities don't have a defined severity so we'll ignore them
 
     return False
 
