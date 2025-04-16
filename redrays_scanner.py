@@ -60,13 +60,6 @@ SEVERITY_LEVELS = {
     "informational": 0
 }
 
-# Exit codes
-EXIT_SUCCESS = 0
-EXIT_VULNERABILITIES_FOUND = 1
-EXIT_NO_FILES_SCANNED = 2
-EXIT_API_ERROR = 3
-EXIT_CREDIT_ERROR = 4
-
 
 def check_dependencies():
     """Check if required packages are installed and install them if needed"""
@@ -113,7 +106,6 @@ class RedRaysScanner:
             "Content-Type": "application/json",
             "x-api-key": api_key
         }
-        self.has_credit_error = False  # Track if a credit error occurred
 
     def scan_code(self, code: str, file_path: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -156,18 +148,14 @@ class RedRaysScanner:
                 # Check for specific error messages about credits
                 if "credit" in error_message.lower() or "subscription" in error_message.lower():
                     logger.error(f"API error: You do not have enough credits. Please check your RedRays subscription.")
-                    self.has_credit_error = True  # Mark that a credit error occurred
                 else:
                     logger.error(f"API error: {error_message}")
 
-                # Return an error result, but don't categorize it as a vulnerability
                 return {
                     "success": False,
                     "error": error_message,
                     "data": None,
-                    "is_api_error": True,  # Flag to identify API errors
-                    "error_message": error_message,
-                    "is_credit_error": "credit" in error_message.lower() or "subscription" in error_message.lower()
+                    "scan_result": [{"title": "API Error", "severity": "Unknown", "description": error_message}]
                 }
 
             response.raise_for_status()
@@ -185,19 +173,11 @@ class RedRaysScanner:
                     error_message = f"{e.response.status_code} - {e.response.text}"
 
             logger.error(f"API error: {error_message}")
-
-            # Check if the error is related to credits
-            is_credit_error = "credit" in error_message.lower() or "subscription" in error_message.lower()
-            if is_credit_error:
-                self.has_credit_error = True
-
             return {
                 "success": False,
                 "error": error_message,
                 "data": None,
-                "is_api_error": True,  # Flag to identify API errors
-                "error_message": error_message,
-                "is_credit_error": is_credit_error
+                "scan_result": [{"title": "API Error", "severity": "Unknown", "description": error_message}]
             }
 
 
@@ -207,99 +187,8 @@ class ReportGenerator:
     """
 
     @staticmethod
-    def generate_credit_error_report(output_format: str, output_file: Optional[str] = None) -> str:
-        """
-        Generate a report specifically for credit errors
-
-        Args:
-            output_format: Report format ('csv', 'html', or 'json')
-            output_file: Output file path (optional)
-
-        Returns:
-            Path to the generated report, or report content if no output file specified
-        """
-        if output_format.lower() == 'html':
-            content = """
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>RedRays ABAP Security Scan - Credit Error</title>
-                <style>
-                    body {
-                        font-family: Arial, sans-serif;
-                        line-height: 1.6;
-                        color: #333;
-                        max-width: 800px;
-                        margin: 0 auto;
-                        padding: 20px;
-                    }
-                    h1 {
-                        color: #d32f2f;
-                        text-align: center;
-                        margin-bottom: 30px;
-                    }
-                    .error-box {
-                        background-color: #ffebee;
-                        border: 1px solid #ffcdd2;
-                        border-radius: 5px;
-                        padding: 20px;
-                        margin-bottom: 30px;
-                    }
-                    .info {
-                        background-color: #f8f9fa;
-                        border: 1px solid #ddd;
-                        border-radius: 5px;
-                        padding: 15px;
-                        margin-bottom: 30px;
-                    }
-                </style>
-            </head>
-            <body>
-                <h1>RedRays ABAP Security Scan Error</h1>
-
-                <div class="error-box">
-                    <h2>Insufficient Credits</h2>
-                    <p>The scan could not be completed because your RedRays account has insufficient credits.</p>
-                    <p>Please check your subscription and ensure you have enough credits to scan your ABAP code.</p>
-                </div>
-
-                <div class="info">
-                    <h2>What to do next</h2>
-                    <p>To resolve this issue, please:</p>
-                    <ol>
-                        <li>Log in to your RedRays account</li>
-                        <li>Check your remaining credits</li>
-                        <li>If needed, upgrade your subscription or purchase additional credits</li>
-                        <li>Run the scan again</li>
-                    </ol>
-                    <p>If you continue to experience issues, please contact RedRays support.</p>
-                </div>
-            </body>
-            </html>
-            """
-        elif output_format.lower() == 'json':
-            error_data = {
-                "report_date": datetime.now().isoformat(),
-                "error": "Insufficient Credits",
-                "message": "The scan could not be completed because your RedRays account has insufficient credits.",
-                "resolution": "Please check your subscription and ensure you have enough credits to scan your ABAP code."
-            }
-            content = json.dumps(error_data, indent=2)
-        else:  # CSV or other formats
-            content = "Error,Message\nInsufficient Credits,The scan could not be completed because your RedRays account has insufficient credits."
-
-        if output_file:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(content)
-            return output_file
-        else:
-            return content
-
-    @staticmethod
     def generate_report(scan_results: List[Dict[str, Any]], output_format: str,
-                        output_file: Optional[str] = None, has_credit_error: bool = False) -> str:
+                        output_file: Optional[str] = None) -> str:
         """
         Generate a report from scan results
 
@@ -307,15 +196,10 @@ class ReportGenerator:
             scan_results: List of scan results
             output_format: Report format ('csv', 'html', or 'json')
             output_file: Output file path (optional)
-            has_credit_error: Whether any credit errors occurred
 
         Returns:
             Path to the generated report, or report content if no output file specified
         """
-        # If we had credit errors, generate a specific credit error report
-        if has_credit_error:
-            return ReportGenerator.generate_credit_error_report(output_format, output_file)
-
         if output_format.lower() == 'csv':
             return ReportGenerator._generate_csv_report(scan_results, output_file)
         elif output_format.lower() == 'html':
@@ -344,10 +228,6 @@ class ReportGenerator:
         for result in scan_results:
             file_path = result.get("file_path", "Unknown")
             scan_guid = result.get("scan_guid", "")
-
-            # Skip API errors
-            if result.get("is_api_error", False):
-                continue
 
             # Get vulnerabilities from scan_result
             vulnerabilities = result.get("vulnerabilities", [])
@@ -424,19 +304,10 @@ class ReportGenerator:
         """
         # Prepare data for HTML
         all_vulnerabilities = []
-        api_errors = []
 
         for result in scan_results:
             file_path = result.get("file_path", "Unknown")
             scan_guid = result.get("scan_guid", "")
-
-            # Handle API errors separately
-            if result.get("is_api_error", False):
-                api_errors.append({
-                    "file_path": file_path,
-                    "error_message": result.get("error_message", "Unknown error")
-                })
-                continue
 
             # Get vulnerabilities from scan_result
             vulnerabilities = result.get("vulnerabilities", [])
@@ -602,20 +473,6 @@ class ReportGenerator:
                 tr:nth-child(even) {
                     background-color: #f9f9f9;
                 }
-                .error-section {
-                    background-color: #ffebee;
-                    border: 1px solid #ffcdd2;
-                    border-radius: 5px;
-                    padding: 15px;
-                    margin-bottom: 30px;
-                }
-                .error-card {
-                    background-color: white;
-                    border: 1px solid #ddd;
-                    border-radius: 5px;
-                    padding: 15px;
-                    margin-bottom: 10px;
-                }
             </style>
         </head>
         <body>
@@ -624,17 +481,9 @@ class ReportGenerator:
             <div class="summary">
                 <h2>Scan Summary</h2>
                 <p>Date: """ + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + """</p>
-                <p>Files Scanned: """ + str(len(scan_results) - len(api_errors)) + """</p>
+                <p>Files Scanned: """ + str(len(scan_results)) + """</p>
                 <p>Vulnerabilities Found: """ + str(len(all_vulnerabilities)) + """</p>
-        """
 
-        # Add error summary if there were API errors
-        if api_errors:
-            html_content += f"""
-                <p>API Errors: {len(api_errors)}</p>
-            """
-
-        html_content += """
                 <h3>Severity Breakdown</h3>
                 <table>
                     <tr>
@@ -657,26 +506,6 @@ class ReportGenerator:
                 </table>
             </div>
         """
-
-        # Add API errors section if any
-        if api_errors:
-            html_content += """
-            <div class="error-section">
-                <h2>API Errors</h2>
-                <p>The following errors occurred while communicating with the RedRays API:</p>
-            """
-
-            for error in api_errors:
-                html_content += f"""
-                <div class="error-card">
-                    <h3>File: {error['file_path']}</h3>
-                    <p>{error['error_message']}</p>
-                </div>
-                """
-
-            html_content += """
-            </div>
-            """
 
         # If no vulnerabilities were found
         if not all_vulnerabilities:
@@ -754,21 +583,12 @@ class ReportGenerator:
         Returns:
             Path to the generated report, or report content if no output file specified
         """
-        # Filter out API errors from count but include them in a separate section
-        api_errors = [result for result in scan_results if result.get("is_api_error", False)]
-        actual_scan_results = [result for result in scan_results if not result.get("is_api_error", False)]
-
         # Create the JSON structure
         report = {
             "report_date": datetime.now().isoformat(),
-            "files_scanned": len(actual_scan_results),
-            "api_errors": len(api_errors),
-            "scan_results": actual_scan_results
+            "files_scanned": len(scan_results),
+            "scan_results": scan_results
         }
-
-        # Add API errors if any
-        if api_errors:
-            report["api_error_details"] = api_errors
 
         json_content = json.dumps(report, indent=2)
 
@@ -824,7 +644,7 @@ def check_threshold_breach(vulnerabilities: List[Dict[str, Any]], threshold: str
 
 def extract_all_vulnerabilities(scan_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Extract all vulnerabilities from scan results, excluding API errors
+    Extract all vulnerabilities from scan results
 
     Args:
         scan_results: List of scan results
@@ -835,10 +655,6 @@ def extract_all_vulnerabilities(scan_results: List[Dict[str, Any]]) -> List[Dict
     all_vulnerabilities = []
 
     for result in scan_results:
-        # Skip API errors, don't count them as vulnerabilities
-        if result.get("is_api_error", False):
-            continue
-
         vulnerabilities = result.get("vulnerabilities", [])
         if not vulnerabilities and "scan_result" in result:
             if isinstance(result["scan_result"], str):
@@ -907,33 +723,27 @@ def main():
                 # Format the result for reporting
                 formatted_result = {
                     "file_path": file_path,
+                    "scan_guid": result.get("data", {}).get("scan_guid", "") if result.get("data") else "",
                     "vulnerabilities": []
                 }
 
-                # Handle API errors specially
-                if result.get("is_api_error", False):
-                    formatted_result["is_api_error"] = True
-                    formatted_result["error_message"] = result.get("error_message", "Unknown API error")
-                    formatted_result["is_credit_error"] = result.get("is_credit_error", False)
+                # Extract vulnerabilities from the scan result
+                if "data" in result and result.get("data"):
+                    scan_result = result["data"].get("scan_result", [])
 
-                # For normal scan results
-                else:
-                    formatted_result["scan_guid"] = result.get("data", {}).get("scan_guid", "") if result.get(
-                        "data") else ""
+                    # If scan_result is a string (JSON), parse it
+                    if isinstance(scan_result, str):
+                        try:
+                            scan_result = json.loads(scan_result)
+                        except json.JSONDecodeError:
+                            scan_result = []
 
-                    # Extract vulnerabilities from the scan result
-                    if "data" in result and result.get("data"):
-                        scan_result = result["data"].get("scan_result", [])
-
-                        # If scan_result is a string (JSON), parse it
-                        if isinstance(scan_result, str):
-                            try:
-                                scan_result = json.loads(scan_result)
-                            except json.JSONDecodeError:
-                                scan_result = []
-
-                        formatted_result["vulnerabilities"] = scan_result
-                        formatted_result["scan_result"] = scan_result
+                    formatted_result["vulnerabilities"] = scan_result
+                    formatted_result["scan_result"] = scan_result
+                elif "scan_result" in result:
+                    # For error cases where we've embedded scan_result directly
+                    formatted_result["vulnerabilities"] = result["scan_result"]
+                    formatted_result["scan_result"] = result["scan_result"]
 
                 scan_results.append(formatted_result)
 
@@ -964,33 +774,27 @@ def main():
                 # Format the result for reporting
                 formatted_result = {
                     "file_path": file_path,
+                    "scan_guid": result.get("data", {}).get("scan_guid", "") if result.get("data") else "",
                     "vulnerabilities": []
                 }
 
-                # Handle API errors specially
-                if result.get("is_api_error", False):
-                    formatted_result["is_api_error"] = True
-                    formatted_result["error_message"] = result.get("error_message", "Unknown API error")
-                    formatted_result["is_credit_error"] = result.get("is_credit_error", False)
+                # Extract vulnerabilities from the scan result
+                if "data" in result and result.get("data"):
+                    scan_result = result["data"].get("scan_result", [])
 
-                # For normal scan results
-                else:
-                    formatted_result["scan_guid"] = result.get("data", {}).get("scan_guid", "") if result.get(
-                        "data") else ""
+                    # If scan_result is a string (JSON), parse it
+                    if isinstance(scan_result, str):
+                        try:
+                            scan_result = json.loads(scan_result)
+                        except json.JSONDecodeError:
+                            scan_result = []
 
-                    # Extract vulnerabilities from the scan result
-                    if "data" in result and result.get("data"):
-                        scan_result = result["data"].get("scan_result", [])
-
-                        # If scan_result is a string (JSON), parse it
-                        if isinstance(scan_result, str):
-                            try:
-                                scan_result = json.loads(scan_result)
-                            except json.JSONDecodeError:
-                                scan_result = []
-
-                        formatted_result["vulnerabilities"] = scan_result
-                        formatted_result["scan_result"] = scan_result
+                    formatted_result["vulnerabilities"] = scan_result
+                    formatted_result["scan_result"] = scan_result
+                elif "scan_result" in result:
+                    # For error cases where we've embedded scan_result directly
+                    formatted_result["vulnerabilities"] = result["scan_result"]
+                    formatted_result["scan_result"] = result["scan_result"]
 
                 scan_results.append(formatted_result)
 
@@ -1002,37 +806,20 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    # Handle the case where no files were scanned
+    # No files scanned - now displays a warning instead of an error
     if not scan_results:
         logger.warning("No files were scanned. No report will be generated.")
-        sys.exit(EXIT_NO_FILES_SCANNED)
-
-    # Check for credit errors before proceeding
-    if scanner.has_credit_error:
-        logger.error("Scan interrupted due to insufficient credits in your RedRays account.")
-        # Generate a credit error report
-        report_path = ReportGenerator.generate_credit_error_report(
-            args.output_format, args.output_file
-        )
-        logger.info(f"Credit error report generated at: {report_path}")
-        sys.exit(EXIT_CREDIT_ERROR)
+        sys.exit(0)  # Exit with success code instead of error
 
     # Generate report
     logger.info(f"Generating {args.output_format} report: {args.output_file}")
     report_path = ReportGenerator.generate_report(
-        scan_results, args.output_format, args.output_file, scanner.has_credit_error
+        scan_results, args.output_format, args.output_file
     )
 
-    # Extract all valid vulnerabilities for threshold checking
+    # Extract all vulnerabilities for threshold checking
     all_vulnerabilities = extract_all_vulnerabilities(scan_results)
     vulnerability_count = len(all_vulnerabilities)
-
-    # Check for API errors (not credit errors) that might have affected the scan
-    api_errors = [result for result in scan_results if
-                  result.get("is_api_error", False) and not result.get("is_credit_error", False)]
-    if api_errors:
-        logger.warning(
-            f"Found {len(api_errors)} API errors during scanning. Some files may not have been properly analyzed.")
 
     # Check if threshold is breached
     threshold_breached = args.threshold and check_threshold_breach(all_vulnerabilities, args.threshold)
@@ -1041,17 +828,17 @@ def main():
         if threshold_breached:
             logger.error(
                 f"Found {vulnerability_count} vulnerabilities with {args.threshold} or higher severity. See report at: {report_path}")
-            sys.exit(EXIT_VULNERABILITIES_FOUND)  # Exit with error if threshold is breached
+            sys.exit(1)  # Exit with error if threshold is breached
         else:
             if args.threshold:
                 logger.warning(
                     f"Found {vulnerability_count} vulnerabilities, but none exceed the {args.threshold} threshold. See report at: {report_path}")
             else:
                 logger.warning(f"Found {vulnerability_count} vulnerabilities. See report at: {report_path}")
-            sys.exit(EXIT_SUCCESS)  # Permit build to continue if no threshold breach
+            sys.exit(0)  # Permit build to continue if no threshold breach
     else:
         logger.info("No vulnerabilities found in the scanned files.")
-        sys.exit(EXIT_SUCCESS)
+        sys.exit(0)
 
 
 if __name__ == "__main__":
