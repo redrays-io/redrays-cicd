@@ -80,13 +80,13 @@ class RedRaysScanner:
     ABAP code security scanner using RedRays API
     """
 
-    def __init__(self, api_key: str, api_url: str = "https://api2.redrays.io/api/scan"):
+    def __init__(self, api_key: str, api_url: str = "https://api.redrays.io/api/scan"):
         """
         Initialize the scanner with API credentials
 
         Args:
             api_key: RedRays API key
-            api_url: RedRays API URL (default: https://api2.redrays.io/api/scan)
+            api_url: RedRays API URL (default: https://api.redrays.io/api/scan)
         """
         self.api_key = api_key
         self.api_url = api_url
@@ -543,7 +543,7 @@ def main():
     """Main function to run the scanner"""
     parser = argparse.ArgumentParser(description='RedRays ABAP Security Scanner')
     parser.add_argument('--api-key', required=True, help='RedRays API key')
-    parser.add_argument('--api-url', default='https://api2.redrays.io/api/scan', help='RedRays API URL')
+    parser.add_argument('--api-url', default='https://api.redrays.io/api/scan', help='RedRays API URL')
     parser.add_argument('--files', help='Comma-separated list of files to scan')
     parser.add_argument('--scan-dir', help='Directory containing ABAP files to scan')
     parser.add_argument('--output-format', default='html', choices=['csv', 'html', 'json'], help='Report output format')
