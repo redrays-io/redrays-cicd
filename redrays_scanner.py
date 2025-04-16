@@ -831,8 +831,9 @@ def main():
             sys.exit(1)  # Exit with error if threshold is breached
         else:
             if args.threshold:
-                logger.warning(
-                    f"Found {vulnerability_count} vulnerabilities, but none exceed the {args.threshold} threshold. See report at: {report_path}")
+                pass
+                #logger.warning(
+                #    f"Found {vulnerability_count} vulnerabilities, but none exceed the {args.threshold} threshold. See report at: {report_path}")
             else:
                 logger.warning(f"Found {vulnerability_count} vulnerabilities. See report at: {report_path}")
             sys.exit(0)  # Permit build to continue if no threshold breach
