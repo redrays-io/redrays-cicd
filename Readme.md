@@ -59,7 +59,7 @@ jobs:
 | Input                   | Description                                       | Required | Default                          |
 |-------------------------|---------------------------------------------------|----------|----------------------------------|
 | `api-key`               | RedRays API key                                   | Yes      |                                  |
-| `api-url`               | RedRays API URL                                   | No       | https://api2.redrays.io/api/scan |
+| `api-url`               | RedRays API URL                                   | No       | https://api.redrays.io/api/scan |
 | `scan-dir`              | Directory containing ABAP files to scan           | No       | .                                |
 | `files`                 | Comma-separated list of specific files to scan    | No       |                                  |
 | `output-format`         | Report output format (csv, html, json)            | No       | html                             |
