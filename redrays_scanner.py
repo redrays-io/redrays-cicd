@@ -145,6 +145,7 @@ class RedRaysScanner:
                 # Check for specific error messages about credits
                 if "credit" in error_message.lower() or "subscription" in error_message.lower():
                     logger.error(f"API error: You do not have enough credits. Please check your RedRays subscription.")
+                    exit(1)
                 else:
                     logger.error(f"API error: {error_message}")
 
