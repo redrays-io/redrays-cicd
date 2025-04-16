@@ -23,20 +23,17 @@ Examples:
     python redrays_scanner.py --api-key YOUR_API_KEY --scan-dir . --threshold high
 """
 
-import os
-import sys
-import logging
-import subprocess
 import argparse
-import json
-import re
 import csv
+import io
+import json
+import logging
+import os
+import subprocess
+import sys
 import time
 from datetime import datetime
-from pathlib import Path
-import io
-import base64
-from typing import List, Dict, Any, Optional, Tuple, Union
+from typing import List, Dict, Any, Optional
 
 # Configure logging
 logging.basicConfig(
@@ -326,7 +323,8 @@ class ReportGenerator:
             # Add vulnerabilities to the master list
             for vuln in vulnerabilities:
                 vuln_data = {}
-
+                if vuln.get("severity", "Unknown") == "Unknown":
+                    continue
                 if isinstance(vuln, dict):
                     # Handle dictionary objects
                     vuln_data = {
@@ -524,7 +522,8 @@ class ReportGenerator:
                                                                                                         "high",
                                                                                                         "medium", "low",
                                                                                                         "informational"] else "severity-unknown"
-
+                if severity_class == "severity-unknown":
+                    continue
                 html_content += f"""
                 <div class="vulnerability-card">
                     <div class="vulnerability-header">
