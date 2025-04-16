@@ -63,7 +63,7 @@ runs:
       shell: bash
       run: |
         # Build command based on inputs
-        CMD="python redrays_scanner.py --api-key ${{ inputs.api-key }} --api-url ${{ inputs.api-url }} --output-format ${{ inputs.output-format }} --output-file ${{ inputs.output-file }}"
+        CMD="python redrays_scanner.py --api-key ${{ inputs.api-key }} --api-url ${{ inputs.api-url }} --output-format ${{ inputs.output-format }} --output-file ${{ inputs.output-file }} --debug"
         
         # Add either --scan-dir or --files depending on input
         if [ -n "${{ inputs.files }}" ]; then
