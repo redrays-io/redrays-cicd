@@ -33,6 +33,10 @@ inputs:
     description: 'Severity threshold for failing the build (critical, high, medium, low, informational)'
     required: false
     default: ''
+  fail-on-api-errors:
+    description: 'Fail the workflow if API errors occur'
+    required: false
+    default: 'false'
 
 outputs:
   report-path:
@@ -44,6 +48,12 @@ outputs:
   threshold-breached:
     description: 'Whether the severity threshold was breached'
     value: ${{ steps.scan.outputs.threshold-breached }}
+  credit-error:
+    description: 'Whether a credit error occurred'
+    value: ${{ steps.scan.outputs.credit-error }}
+  api-errors:
+    description: 'Number of API errors that occurred'
+    value: ${{ steps.scan.outputs.api-errors }}
 
 runs:
   using: 'composite'
@@ -92,37 +102,67 @@ runs:
         # Set outputs
         echo "report-path=${{ inputs.output-file }}" >> $GITHUB_OUTPUT
         
-        # Check for vulnerabilities found
-        if [ -f "${{ inputs.output-file }}" ]; then
-          if [[ "${{ inputs.output-format }}" == "html" ]]; then
-            VULNS=$(grep -o "Vulnerabilities Found: [0-9]*" ${{ inputs.output-file }} | awk '{print $3}')
-          elif [[ "${{ inputs.output-format }}" == "json" ]]; then
-            VULNS=$(grep -o '"files_scanned":.*' ${{ inputs.output-file }} | awk '{print $2}' | sed 's/,//')
-          else
-            # For CSV or other formats, count lines minus header
-            VULNS=$(($(wc -l < ${{ inputs.output-file }}) - 1))
-            if [ $VULNS -lt 0 ]; then VULNS=0; fi
-          fi
-          
-          echo "vulnerabilities-found=$VULNS" >> $GITHUB_OUTPUT
-          echo "Found $VULNS vulnerabilities"
-          
-          # Determine if we should fail based on threshold
-          if [[ "${{ inputs.threshold }}" != "" && $SCAN_EXIT_CODE -eq 0 && $VULNS -gt 0 ]]; then
+        # Process exit codes
+        case $SCAN_EXIT_CODE in
+          0)
+            echo "Scan completed successfully with no vulnerabilities found"
+            echo "vulnerabilities-found=0" >> $GITHUB_OUTPUT
             echo "threshold-breached=false" >> $GITHUB_OUTPUT
-            echo "::warning::Vulnerabilities found but did not exceed the ${{ inputs.threshold }} threshold"
-          elif [[ $SCAN_EXIT_CODE -eq 1 ]]; then
-            echo "threshold-breached=true" >> $GITHUB_OUTPUT
-            echo "::error::Security vulnerabilities detected exceeding ${{ inputs.threshold }} threshold! See the report for details."
-            exit 1
-          elif [[ "${{ inputs.fail-on-vulnerabilities }}" == "true" && $VULNS -gt 0 ]]; then
-            echo "threshold-breached=true" >> $GITHUB_OUTPUT
-            echo "::error::Security vulnerabilities detected! See the report for details."
-            exit 1
-          else
+            echo "credit-error=false" >> $GITHUB_OUTPUT
+            echo "api-errors=0" >> $GITHUB_OUTPUT
+            ;;
+          1)
+            # Vulnerabilities found that breach threshold
+            if [ -f "${{ inputs.output-file }}" ]; then
+              if [[ "${{ inputs.output-format }}" == "html" ]]; then
+                VULNS=$(grep -o "Vulnerabilities Found: [0-9]*" ${{ inputs.output-file }} | awk '{print $3}')
+              elif [[ "${{ inputs.output-format }}" == "json" ]]; then
+                VULNS=$(grep -o '"files_scanned":.*' ${{ inputs.output-file }} | awk '{print $2}' | sed 's/,//')
+              else
+                # For CSV or other formats, count lines minus header
+                VULNS=$(($(wc -l < ${{ inputs.output-file }}) - 1))
+                if [ $VULNS -lt 0 ]; then VULNS=0; fi
+              fi
+              
+              echo "vulnerabilities-found=$VULNS" >> $GITHUB_OUTPUT
+              echo "Found $VULNS vulnerabilities that breach the threshold"
+              echo "threshold-breached=true" >> $GITHUB_OUTPUT
+              echo "credit-error=false" >> $GITHUB_OUTPUT
+              echo "api-errors=0" >> $GITHUB_OUTPUT
+              
+              if [[ "${{ inputs.fail-on-vulnerabilities }}" == "true" ]]; then
+                echo "::error::Security vulnerabilities detected that breach the threshold! See the report for details."
+                exit 1
+              fi
+            fi
+            ;;
+          2)
+            # No files scanned
+            echo "vulnerabilities-found=0" >> $GITHUB_OUTPUT
             echo "threshold-breached=false" >> $GITHUB_OUTPUT
-          fi
-        else
-          echo "::error::Report file not generated"
-          exit 1
-        fi
+            echo "credit-error=false" >> $GITHUB_OUTPUT
+            echo "api-errors=0" >> $GITHUB_OUTPUT
+            echo "::warning::No ABAP files were found to scan"
+            ;;
+          4)
+            # Credit error
+            echo "vulnerabilities-found=0" >> $GITHUB_OUTPUT
+            echo "threshold-breached=false" >> $GITHUB_OUTPUT
+            echo "credit-error=true" >> $GITHUB_OUTPUT
+            echo "api-errors=0" >> $GITHUB_OUTPUT
+            echo "::warning::Insufficient credits in your RedRays account. Check the report for details."
+            ;;
+          *)
+            # API errors or other issues
+            echo "vulnerabilities-found=0" >> $GITHUB_OUTPUT
+            echo "threshold-breached=false" >> $GITHUB_OUTPUT
+            echo "credit-error=false" >> $GITHUB_OUTPUT
+            echo "api-errors=1" >> $GITHUB_OUTPUT
+            echo "::warning::Scanner encountered errors. Check the report for details."
+            
+            if [[ "${{ inputs.fail-on-api-errors }}" == "true" ]]; then
+              echo "::error::API errors encountered during scanning! See the report for details."
+              exit 1
+            fi
+            ;;
+        esac
