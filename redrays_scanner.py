@@ -859,15 +859,15 @@ def main():
     if vulnerability_count > 0:
         if threshold_breached:
             logger.error(
-                f"Found {vulnerability_count} vulnerabilities with {args.threshold} or higher severity. See report at: {report_path}")
+                f"Vulnerability(ies) have been found with {args.threshold} or higher severity. See report at: {report_path}")
             sys.exit(1)  # Exit with error if threshold is breached
         else:
             if args.threshold:
                 pass
-                # logger.warning(
-                #    f"Found {vulnerability_count} vulnerabilities, but none exceed the {args.threshold} threshold. See report at: {report_path}")
+                logger.warning(
+                    f"Vulnerability(ies) have been found, but none exceed the {args.threshold} threshold. See report at: {report_path}")
             else:
-                logger.warning(f"Found {vulnerability_count} vulnerabilities. See report at: {report_path}")
+                logger.warning(f"Vulnerability(ies) have been found. See report at: {report_path}")
             sys.exit(0)  # Permit build to continue if no threshold breach
     else:
         logger.info("No vulnerabilities found in the scanned files.")
