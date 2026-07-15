@@ -1,877 +1,582 @@
 #!/usr/bin/env python3
 """
-RedRays ABAP Security Scanner
+RedRays ABAP Security Scanner - MC /agent/v1 client.
 
-A self-contained script for scanning ABAP code for security vulnerabilities
-using the RedRays API. This script checks for required dependencies, installs
-them if needed, and performs security scanning of ABAP files.
+Vendored inside the GitHub Action and executed via
+${{ github.action_path }}/redrays_scanner.py so that a pinned action tag
+pins the client logic too (no runtime fetch from master).
 
-Usage:
-    python redrays_scanner.py --api-key YOUR_API_KEY [options]
+Contract: MC AgentScanController @RequestMapping("/agent/v1").
+Auth header: X-RedRays-Api-Key (developer PAT).
 
-Examples:
-    # Scan all ABAP files in current directory:
-    python redrays_scanner.py --api-key YOUR_API_KEY --scan-dir .
-
-    # Scan specific files:
-    python redrays_scanner.py --api-key YOUR_API_KEY --files file1.abap,file2.abap
-
-    # Change output format:
-    python redrays_scanner.py --api-key YOUR_API_KEY --scan-dir . --output-format csv
-
-    # Set severity threshold:
-    python redrays_scanner.py --api-key YOUR_API_KEY --scan-dir . --threshold high
+The API token is read ONLY from the REDRAYS_TOKEN environment variable.
+It is never accepted as a CLI argument and never printed.
 """
 
 import argparse
 import csv
+import html
 import io
 import json
-import logging
 import os
-import subprocess
+import re
 import sys
 import time
-from datetime import datetime
-from typing import List, Dict, Any, Optional
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("redrays-scanner")
+# ---------------------------------------------------------------------------
+# Constants derived strictly from the MC contract
+# ---------------------------------------------------------------------------
 
-# Required packages
-REQUIRED_PACKAGES = ['requests']
+DEFAULT_API_BASE = "http://localhost:8080/agent/v1"  # MC agent base; override via --api-url
+AUTH_HEADER = "X-RedRays-Api-Key"
+SOURCE_HEADER = "X-RedRays-Source"
+SOURCE_LABEL = "GITHUB_ACTION"
 
-# Define severity levels with numerical values for comparison
-SEVERITY_LEVELS = {
-    "critical": 4,
-    "high": 3,
-    "medium": 2,
-    "low": 1,
-    "informational": 0
+# Contract severity ordering: CRITICAL>HIGH>MEDIUM>LOW>INFO
+SEVERITY_ORDER = {
+    "CRITICAL": 4,
+    "HIGH": 3,
+    "MEDIUM": 2,
+    "LOW": 1,
+    "INFO": 0,
+    "INFORMATIONAL": 0,  # accept the legacy CLI alias for INFO
 }
 
+# Contract batch cap
+MAX_BATCH = 200
 
-def check_dependencies():
-    """Check if required packages are installed and install them if needed"""
-    missing_packages = []
-    for package in REQUIRED_PACKAGES:
+# Polling
+POLL_INTERVAL_SECONDS = 5
+POLL_TIMEOUT_SECONDS = 3600
+HTTP_TIMEOUT_SECONDS = 60
+MAX_RETRIES = 5
+
+
+class ScanError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+def _request(method, url, token, body=None, headers=None):
+    """Perform an HTTP request. Returns (status_code, parsed_json_or_text)."""
+    data = None
+    req_headers = {AUTH_HEADER: token}
+    if headers:
+        req_headers.update(headers)
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        req_headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
+
+    last_exc = None
+    for attempt in range(MAX_RETRIES):
         try:
-            __import__(package)
-        except ImportError:
-            missing_packages.append(package)
-
-    if missing_packages:
-        logger.info(f"Installing required packages: {', '.join(missing_packages)}")
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing_packages)
-            logger.info("Dependencies installed successfully")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to install dependencies: {e}")
-            sys.exit(1)
-
-
-# Install dependencies before importing them
-check_dependencies()
-
-# Now import the required packages
-import requests
-
-
-class RedRaysScanner:
-    """
-    ABAP code security scanner using RedRays API
-    """
-
-    def __init__(self, api_key: str, api_url: str = "https://api.redrays.io/api/scan"):
-        """
-        Initialize the scanner with API credentials
-
-        Args:
-            api_key: RedRays API key
-            api_url: RedRays API URL (default: https://api.redrays.io/api/scan)
-        """
-        self.api_key = api_key
-        self.api_url = api_url
-        self.headers = {
-            "Content-Type": "application/json",
-            "x-api-key": api_key
-        }
-
-    def scan_code(self, code: str, file_path: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Scan ABAP code using RedRays API
-
-        Args:
-            code: ABAP code to scan
-            file_path: Path of the file (optional)
-
-        Returns:
-            Dict containing scan results
-        """
-        payload = {"code": code}
-        if file_path:
-            payload["file_path"] = file_path
-
-        try:
-            logger.info(f"[ScanCode] Scanning file: {file_path or 'unnamed'}")
-            response = requests.post(self.api_url, json=payload, headers=self.headers)
-
-            # Check for API rate limits
-            if response.status_code == 429:
-                retry_after = int(response.headers.get('Retry-After', '30'))
-                logger.warning(f"API rate limit reached. Retrying after {retry_after} seconds...")
-                time.sleep(retry_after)
-                return self.scan_code(code, file_path)  # Retry the request
-
-            # Handle 400 errors more gracefully - could be due to no credits left
-            if response.status_code == 400:
-                error_message = "Bad Request"
-                try:
-                    error_data = response.json()
-                    if "message" in error_data:
-                        error_message = error_data["message"]
-                    elif "error" in error_data:
-                        error_message = error_data["error"]
-                except:
-                    pass
-
-                # Check for specific error messages about credits
-                if "credit" in error_message.lower() or "subscription" in error_message.lower():
-                    logger.error(f"API error: You do not have enough credits. Please check your RedRays subscription.")
-                    exit(1)
-                else:
-                    logger.error(f"API error: {error_message}")
-
-                return {
-                    "success": False,
-                    "error": error_message,
-                    "data": None,
-                    "scan_result": [{"title": "API Error", "severity": "Unknown", "description": error_message}]
-                }
-
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            error_message = str(e)
-            if hasattr(e, 'response') and e.response:
-                try:
-                    error_data = e.response.json()
-                    if "message" in error_data:
-                        error_message = error_data["message"]
-                    elif "error" in error_data:
-                        error_message = error_data["error"]
-                except:
-                    error_message = f"{e.response.status_code} - {e.response.text}"
-
-            logger.error(f"API error: {error_message}")
-            return {
-                "success": False,
-                "error": error_message,
-                "data": None,
-                "scan_result": [{"title": "API Error", "severity": "Unknown", "description": error_message}]
-            }
-
-
-class ReportGenerator:
-    """
-    Generates vulnerability reports in various formats
-    """
-
-    @staticmethod
-    def generate_report(scan_results: List[Dict[str, Any]], output_format: str,
-                        output_file: Optional[str] = None) -> str:
-        """
-        Generate a report from scan results
-
-        Args:
-            scan_results: List of scan results
-            output_format: Report format ('csv', 'html', or 'json')
-            output_file: Output file path (optional)
-
-        Returns:
-            Path to the generated report, or report content if no output file specified
-        """
-        if output_format.lower() == 'csv':
-            return ReportGenerator._generate_csv_report(scan_results, output_file)
-        elif output_format.lower() == 'html':
-            return ReportGenerator._generate_html_report(scan_results, output_file)
-        elif output_format.lower() == 'json':
-            return ReportGenerator._generate_json_report(scan_results, output_file)
-        else:
-            logger.error(f"Unsupported output format: {output_format}")
-            return ""
-
-    @staticmethod
-    def _generate_csv_report(scan_results: List[Dict[str, Any]], output_file: Optional[str] = None) -> str:
-        """
-        Generate a CSV report from scan results
-
-        Args:
-            scan_results: List of scan results
-            output_file: Output file path (optional)
-
-        Returns:
-            Path to the generated report, or report content if no output file specified
-        """
-        # Prepare data for CSV
-        all_vulnerabilities = []
-
-        for result in scan_results:
-            file_path = result.get("file_path", "Unknown")
-            scan_guid = result.get("scan_guid", "")
-
-            # Get vulnerabilities from scan_result
-            vulnerabilities = result.get("vulnerabilities", [])
-            if not vulnerabilities and "scan_result" in result:
-                # Try to extract vulnerabilities from scan_result if it's a string
-                if isinstance(result["scan_result"], str):
-                    try:
-                        scan_result = json.loads(result["scan_result"])
-                        vulnerabilities = scan_result if isinstance(scan_result, list) else []
-                    except json.JSONDecodeError:
-                        vulnerabilities = []
-                # If scan_result is already a list
-                elif isinstance(result["scan_result"], list):
-                    vulnerabilities = result["scan_result"]
-
-            # Add vulnerabilities to the master list
-            for vuln in vulnerabilities:
-                if isinstance(vuln, dict):
-                    # Handle dictionary object
-                    all_vulnerabilities.append({
-                        "File Path": file_path,
-                        "Scan GUID": scan_guid,
-                        "Title": vuln.get("title", ""),
-                        "Severity": vuln.get("severity", "Unknown"),
-                        "Description": vuln.get("description", ""),
-                        "Program": vuln.get("about_program", "")
-                    })
-                elif isinstance(vuln, str):
-                    # Handle string (might be a raw message or error)
-                    all_vulnerabilities.append({
-                        "File Path": file_path,
-                        "Scan GUID": scan_guid,
-                        "Title": "Unknown",
-                        "Severity": "Unknown",
-                        "Description": vuln,
-                        "Program": ""
-                    })
-
-        # If no vulnerabilities were found
-        if not all_vulnerabilities:
-            empty_report = "No vulnerabilities found in the scanned files."
-            if output_file:
-                with open(output_file, 'w', newline='') as f:
-                    f.write(empty_report)
-                return output_file
-            return empty_report
-
-        # Generate CSV
-        if output_file:
-            with open(output_file, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=all_vulnerabilities[0].keys())
-                writer.writeheader()
-                writer.writerows(all_vulnerabilities)
-            return output_file
-        else:
-            # Return as string if no output file specified
-            output = io.StringIO()
-            writer = csv.DictWriter(output, fieldnames=all_vulnerabilities[0].keys())
-            writer.writeheader()
-            writer.writerows(all_vulnerabilities)
-            return output.getvalue()
-
-    @staticmethod
-    def _generate_html_report(scan_results: List[Dict[str, Any]], output_file: Optional[str] = None) -> str:
-        """
-        Generate an HTML report from scan results
-
-        Args:
-            scan_results: List of scan results
-            output_file: Output file path (optional)
-
-        Returns:
-            Path to the generated report, or report content if no output file specified
-        """
-        # Prepare data for HTML
-        all_vulnerabilities = []
-        api_errors = []
-
-        for result in scan_results:
-            file_path = result.get("file_path", "Unknown")
-            scan_guid = result.get("scan_guid", "")
-
-            # Handle API errors separately
-            if result.get("is_api_error", False):
-                api_errors.append({
-                    "file_path": file_path,
-                    "error_message": result.get("error_message", "Unknown error")
-                })
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                return resp.status, _parse(raw)
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", errors="replace")
+            # 5xx are retryable; 4xx are not
+            if 500 <= e.code < 600 and attempt < MAX_RETRIES - 1:
+                last_exc = e
+                time.sleep(POLL_INTERVAL_SECONDS * (attempt + 1))
                 continue
-
-            # Get vulnerabilities from scan_result
-            vulnerabilities = result.get("vulnerabilities", [])
-            if not vulnerabilities and "scan_result" in result:
-                # Try to extract vulnerabilities from scan_result if it's a string
-                if isinstance(result["scan_result"], str):
-                    try:
-                        scan_result = json.loads(result["scan_result"])
-                        vulnerabilities = scan_result if isinstance(scan_result, list) else []
-                    except json.JSONDecodeError:
-                        vulnerabilities = [result["scan_result"]]  # Use the string as a single vulnerability
-                # If scan_result is already a list
-                elif isinstance(result["scan_result"], list):
-                    vulnerabilities = result["scan_result"]
-
-            # Add vulnerabilities to the master list
-            for vuln in vulnerabilities:
-                vuln_data = {}
-
-                if isinstance(vuln, dict):
-                    # Skip "Unknown" severity vulnerabilities if they're dictionaries
-                    if vuln.get("severity", "Unknown").lower() == "unknown":
-                        continue
-
-                    # Handle dictionary objects
-                    vuln_data = {
-                        "file_path": file_path,
-                        "scan_guid": scan_guid,
-                        "title": vuln.get("title", ""),
-                        "severity": vuln.get("severity", "Unknown"),
-                        "description": vuln.get("description", ""),
-                        "about_program": vuln.get("about_program", ""),
-                        "dataflow": vuln.get("dataflow_of_vulnerable_parameter", "")
-                    }
-                else:
-                    # Skip this case as it's likely a parsing artifact
-                    continue
-
-                    # If you want to include these, uncomment the below code:
-                    # # Handle string or other non-dictionary values
-                    # vuln_data = {
-                    #     "file_path": file_path,
-                    #     "scan_guid": scan_guid,
-                    #     "title": "Unknown Issue",
-                    #     "severity": "Unknown",
-                    #     "description": str(vuln) if vuln else "",
-                    #     "about_program": "",
-                    #     "dataflow": ""
-                    # }
-
-                all_vulnerabilities.append(vuln_data)
-
-        # Generate HTML
-        html_content = """
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>RedRays ABAP Security Scan Report</title>
-            <style>
-                body {
-                    font-family: Arial, sans-serif;
-                    line-height: 1.6;
-                    color: #333;
-                    max-width: 1200px;
-                    margin: 0 auto;
-                    padding: 20px;
-                }
-                h1 {
-                    color: #2c3e50;
-                    text-align: center;
-                    margin-bottom: 30px;
-                }
-                .summary {
-                    background-color: #f8f9fa;
-                    border: 1px solid #ddd;
-                    border-radius: 5px;
-                    padding: 15px;
-                    margin-bottom: 30px;
-                }
-                .vulnerability-card {
-                    background-color: white;
-                    border: 1px solid #ddd;
-                    border-radius: 5px;
-                    padding: 15px;
-                    margin-bottom: 20px;
-                    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-                }
-                .vulnerability-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 10px;
-                    border-bottom: 1px solid #eee;
-                    padding-bottom: 10px;
-                }
-                .vulnerability-title {
-                    font-size: 18px;
-                    font-weight: bold;
-                    margin: 0;
-                }
-                .vulnerability-severity {
-                    padding: 5px 10px;
-                    border-radius: 3px;
-                    font-weight: bold;
-                    color: white;
-                }
-                .severity-critical {
-                    background-color: #d32f2f;
-                }
-                .severity-high {
-                    background-color: #f44336;
-                }
-                .severity-medium {
-                    background-color: #ff9800;
-                }
-                .severity-low {
-                    background-color: #4caf50;
-                }
-                .severity-informational {
-                    background-color: #2196f3;
-                }
-                .severity-unknown {
-                    background-color: #9e9e9e;
-                }
-                .file-path {
-                    font-family: monospace;
-                    background-color: #f5f5f5;
-                    padding: 3px 6px;
-                    border-radius: 3px;
-                    margin-top: 5px;
-                    display: inline-block;
-                }
-                .details-block {
-                    margin-top: 15px;
-                }
-                .details-title {
-                    font-weight: bold;
-                    margin-bottom: 5px;
-                }
-                .dataflow {
-                    font-family: monospace;
-                    background-color: #f8f9fa;
-                    padding: 10px;
-                    border-radius: 3px;
-                    white-space: pre-wrap;
-                    overflow-x: auto;
-                    border: 1px solid #ddd;
-                }
-                .no-vulnerabilities {
-                    text-align: center;
-                    padding: 50px;
-                    background-color: #f8f9fa;
-                    border: 1px solid #ddd;
-                    border-radius: 5px;
-                }
-                table {
-                    width: 100%;
-                    border-collapse: collapse;
-                    margin-bottom: 20px;
-                }
-                th, td {
-                    border: 1px solid #ddd;
-                    padding: 8px;
-                }
-                th {
-                    background-color: #f2f2f2;
-                    text-align: left;
-                }
-                tr:nth-child(even) {
-                    background-color: #f9f9f9;
-                }
-            </style>
-        </head>
-        <body>
-            <h1>RedRays ABAP Security Scan Report</h1>
-
-            <div class="summary">
-                <h2>Scan Summary</h2>
-                <p>Date: """ + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + """</p>
-                <p>Files Scanned: """ + str(len(scan_results)) + """</p>
-                <p>Vulnerabilities Found: """ + str(len(all_vulnerabilities)) + """</p>
-
-                <h3>Severity Breakdown</h3>
-                <table>
-                    <tr>
-                        <th>Severity</th>
-                        <th>Count</th>
-                    </tr>
-        """
-
-        # Count vulnerabilities by severity
-        severity_counts = {}
-        for vuln in all_vulnerabilities:
-            severity = vuln["severity"].lower()
-            severity_counts[severity] = severity_counts.get(severity, 0) + 1
-
-        # Add severity breakdown to HTML
-        for severity, count in severity_counts.items():
-            html_content += f"<tr><td>{severity.capitalize()}</td><td>{count}</td></tr>"
-
-        html_content += """
-                </table>
-            </div>
-        """
-
-        # If no vulnerabilities were found
-        if not all_vulnerabilities:
-            html_content += """
-            <div class="no-vulnerabilities">
-                <h2>No vulnerabilities found in the scanned files.</h2>
-                <p>Your ABAP code appears to be secure according to the RedRays security analysis.</p>
-            </div>
-            """
-        else:
-            # Add vulnerabilities to HTML
-            html_content += "<h2>Vulnerability Details</h2>"
-
-            for vuln in all_vulnerabilities:
-                severity_class = f"severity-{vuln['severity'].lower()}" if vuln['severity'].lower() in ["critical",
-                                                                                                        "high",
-                                                                                                        "medium", "low",
-                                                                                                        "informational"] else "severity-unknown"
-                if severity_class == "severity-unknown":
-                    continue
-                html_content += f"""
-                <div class="vulnerability-card">
-                    <div class="vulnerability-header">
-                        <h3 class="vulnerability-title">{vuln['title']}</h3>
-                        <span class="vulnerability-severity {severity_class}">{vuln['severity']}</span>
-                    </div>
-                    <div class="file-path">{vuln['file_path']}</div>
-
-                    <div class="details-block">
-                        <div class="details-title">Description</div>
-                        <p>{vuln['description']}</p>
-                    </div>
-                """
-
-                if vuln['about_program']:
-                    html_content += f"""
-                    <div class="details-block">
-                        <div class="details-title">About Program</div>
-                        <p>{vuln['about_program']}</p>
-                    </div>
-                    """
-
-                if vuln['dataflow']:
-                    # Replace <br> tags with newlines for better display
-                    dataflow = vuln['dataflow'].replace("<br>", "\n")
-                    html_content += f"""
-                    <div class="details-block">
-                        <div class="details-title">Data Flow</div>
-                        <div class="dataflow">{dataflow}</div>
-                    </div>
-                    """
-
-                html_content += "</div>"
-
-        html_content += """
-        </body>
-        </html>
-        """
-
-        if output_file:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-            return output_file
-        else:
-            return html_content
-
-    @staticmethod
-    def _generate_json_report(scan_results: List[Dict[str, Any]], output_file: Optional[str] = None) -> str:
-        """
-        Generate a JSON report from scan results
-
-        Args:
-            scan_results: List of scan results
-            output_file: Output file path (optional)
-
-        Returns:
-            Path to the generated report, or report content if no output file specified
-        """
-        # Create the JSON structure
-        report = {
-            "report_date": datetime.now().isoformat(),
-            "files_scanned": len(scan_results),
-            "scan_results": scan_results
-        }
-
-        json_content = json.dumps(report, indent=2)
-
-        if output_file:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(json_content)
-            return output_file
-        else:
-            return json_content
+            return e.code, _parse(raw)
+        except urllib.error.URLError as e:
+            last_exc = e
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(POLL_INTERVAL_SECONDS * (attempt + 1))
+                continue
+            raise ScanError("Network error contacting %s: %s" % (url, e))
+    raise ScanError("Request failed after %d attempts: %s" % (MAX_RETRIES, last_exc))
 
 
-def find_abap_files(directory: str) -> List[str]:
-    """
-    Find all ABAP files in a directory and its subdirectories
-
-    Args:
-        directory: Directory to search in
-
-    Returns:
-        List of ABAP file paths
-    """
-    abap_files = []
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.lower().endswith('.abap'):
-                abap_files.append(os.path.join(root, file))
-    return abap_files
+def _parse(raw):
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
 
 
-def check_threshold_breach(vulnerabilities: List[Dict[str, Any]], threshold: str) -> bool:
-    """
-    Check if any vulnerability exceeds the threshold severity
+def _err_msg(payload, default):
+    if isinstance(payload, dict) and "error" in payload:
+        return str(payload["error"])
+    return default
 
-    Args:
-        vulnerabilities: List of vulnerabilities
-        threshold: Severity threshold (critical, high, medium, low, or informational)
 
-    Returns:
-        True if threshold is breached, False otherwise
-    """
-    if not threshold or threshold.lower() not in SEVERITY_LEVELS:
+# ---------------------------------------------------------------------------
+# Contract endpoint wrappers
+# ---------------------------------------------------------------------------
+
+def verify_token(base, token):
+    """GET /me - whoami / token connectivity check."""
+    status, payload = _request("GET", base + "/me", token)
+    if status == 401:
+        raise ScanError("Token verification failed (401): %s"
+                        % _err_msg(payload, "Not authenticated"))
+    if status != 200:
+        raise ScanError("Token verification failed (%d): %s"
+                        % (status, _err_msg(payload, "unexpected response")))
+    dev = payload.get("developerName") or payload.get("developerEmail") or "developer"
+    return dev
+
+
+def submit_batch(base, token, programs, scan_profile):
+    """POST /scan-batch - returns scan_id (session GUID)."""
+    body = {"programs": programs, "scanProfile": scan_profile}
+    status, payload = _request(
+        "POST", base + "/scan-batch", token, body=body,
+        headers={SOURCE_HEADER: SOURCE_LABEL},
+    )
+    if status == 200 and isinstance(payload, dict) and payload.get("scan_id"):
+        return payload["scan_id"]
+    if status == 403:
+        raise ScanError("License limit (403): %s" % _err_msg(payload, "license error"))
+    raise ScanError("Batch submit failed (%d): %s"
+                    % (status, _err_msg(payload, "unexpected response")))
+
+
+def poll_result(base, token, scan_id):
+    """GET /scan-result/{scanId} - poll until COMPLETED or FAILED."""
+    deadline = time.time() + POLL_TIMEOUT_SECONDS
+    last_progress = -1
+    while True:
+        status, payload = _request("GET", base + "/scan-result/" + scan_id, token)
+        if status == 404:
+            raise ScanError("Scan not found: %s" % scan_id)
+        if status != 200 or not isinstance(payload, dict):
+            raise ScanError("Poll failed (%d): %s"
+                            % (status, _err_msg(payload, "unexpected response")))
+        state = payload.get("status", "PENDING")
+        progress = payload.get("progress", 0)
+        if progress != last_progress:
+            phase = payload.get("phase")
+            print("  scan %s: %s %s%%%s" % (
+                scan_id, state, progress,
+                (" (" + str(phase) + ")") if phase else ""))
+            last_progress = progress
+        if state == "COMPLETED":
+            return payload
+        if state == "FAILED":
+            raise ScanError("Scan FAILED (failed_objects=%s)"
+                            % payload.get("failed_objects"))
+        if time.time() > deadline:
+            raise ScanError("Polling timed out after %ds (last status %s)"
+                            % (POLL_TIMEOUT_SECONDS, state))
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def get_findings(base, token, scan_id):
+    """GET /findings?scan_id= - returns list of finding dicts."""
+    url = base + "/findings?scan_id=" + urllib.parse.quote(scan_id)
+    status, payload = _request("GET", url, token)
+    if status != 200 or not isinstance(payload, dict):
+        raise ScanError("Findings fetch failed (%d): %s"
+                        % (status, _err_msg(payload, "unexpected response")))
+    return payload.get("findings", [])
+
+
+# ---------------------------------------------------------------------------
+# File collection
+# ---------------------------------------------------------------------------
+
+def classify_object_type(source):
+    """FUNCTION vs PROGRAM from the SOURCE (a name-prefix guess mislabels real FMs).
+    A function-module include is FUNCTION <name>. ... ENDFUNCTION; everything else
+    (reports, executable programs, classes) is submitted as PROGRAM per the contract."""
+    if re.search(r"(?im)^\s*FUNCTION\s+[\w/]+", source) and re.search(r"(?im)^\s*ENDFUNCTION\b", source):
+        return "FUNCTION"
+    return "PROGRAM"
+
+
+def collect_programs(files_arg, scan_dir):
+    """Build the contract 'programs' list from --files or --scan-dir."""
+    paths = []
+    if files_arg:
+        for f in files_arg.split(","):
+            f = f.strip()
+            if f:
+                paths.append(f)
+    else:
+        for root, _dirs, names in os.walk(scan_dir):
+            for name in names:
+                if name.lower().endswith(".abap"):
+                    paths.append(os.path.join(root, name))
+    paths.sort()
+
+    programs = []
+    for path in paths:
+        if not os.path.isfile(path):
+            print("WARNING: skipping missing file: %s" % path, file=sys.stderr)
+            continue
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            source = fh.read()
+        if not source.strip():
+            print("WARNING: skipping empty file: %s" % path, file=sys.stderr)
+            continue
+        object_name = os.path.splitext(os.path.basename(path))[0]
+        object_type = classify_object_type(source)
+        programs.append({
+            "objectName": object_name,
+            "objectType": object_type,
+            "source": source,        # RAW TEXT per contract (not base64)
+            "_path": path,           # local-only; stripped before submit
+        })
+    return programs
+
+
+# ---------------------------------------------------------------------------
+# Threshold gating
+# ---------------------------------------------------------------------------
+
+def severity_rank(sev):
+    return SEVERITY_ORDER.get((sev or "").strip().upper(), -1)
+
+
+def threshold_breached(findings, threshold):
+    if not threshold:
         return False
-
-    threshold_value = SEVERITY_LEVELS[threshold.lower()]
-
-    for vuln in vulnerabilities:
-        # Handle both dictionary and string vulnerabilities
-        if isinstance(vuln, dict):
-            severity = vuln.get("severity", "").lower()
-            if severity in SEVERITY_LEVELS and SEVERITY_LEVELS[severity] >= threshold_value:
-                return True
-        # String vulnerabilities don't have a defined severity so we'll ignore them
-
+    gate = SEVERITY_ORDER.get(threshold.strip().upper())
+    if gate is None:
+        return False
+    for f in findings:
+        rank = severity_rank(f.get("severity"))
+        if rank >= 0 and rank >= gate:
+            return True
     return False
 
 
-def extract_all_vulnerabilities(scan_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Extract all vulnerabilities from scan results, excluding those with "Unknown" risk
+# ---------------------------------------------------------------------------
+# Report writers
+# ---------------------------------------------------------------------------
 
-    Args:
-        scan_results: List of scan results
+def write_json_report(findings, out_file, scan_id, files_scanned):
+    counts = _severity_counts(findings)
+    report = {
+        "report_date": datetime.now(timezone.utc).isoformat(),
+        "scan_id": scan_id,
+        "files_scanned": files_scanned,
+        "vulnerabilities_found": len(findings),
+        "severity_counts": counts,
+        "findings": findings,
+    }
+    with open(out_file, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2)
 
-    Returns:
-        List of all vulnerabilities except those with Unknown risk
-    """
-    all_vulnerabilities = []
 
-    for result in scan_results:
-        # Skip API errors, don't count them as vulnerabilities
-        if result.get("is_api_error", False):
-            continue
+def write_csv_report(findings, out_file):
+    with open(out_file, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow([
+            "Object Name", "Finding ID", "Severity", "Line",
+            "Issue Title", "Issue Type", "Description", "Recommendation", "Status",
+        ])
+        for f in findings:
+            writer.writerow([
+                f.get("object_name", ""), f.get("finding_id", ""),
+                f.get("severity", ""), f.get("line_number", ""),
+                f.get("issue_title", ""), f.get("issue_type", ""),
+                f.get("issue_description", ""), f.get("recommendation", ""),
+                f.get("status", ""),
+            ])
 
-        vulnerabilities = result.get("vulnerabilities", [])
-        if not vulnerabilities and "scan_result" in result:
-            if isinstance(result["scan_result"], str):
-                try:
-                    scan_result = json.loads(result["scan_result"])
-                    vulnerabilities = scan_result if isinstance(scan_result, list) else []
-                except json.JSONDecodeError:
-                    vulnerabilities = []
-            elif isinstance(result["scan_result"], list):
-                vulnerabilities = result["scan_result"]
 
-        # Filter out vulnerabilities with "Unknown" risk
-        filtered_vulnerabilities = []
-        for vuln in vulnerabilities:
-            if isinstance(vuln, dict) and vuln.get("severity", "").lower() != "unknown":
-                filtered_vulnerabilities.append(vuln)
-            # For non-dict vulnerabilities, we'll still include them as they don't have a standard severity
-            elif not isinstance(vuln, dict):
-                filtered_vulnerabilities.append(vuln)
+def write_html_report(findings, out_file, scan_id, files_scanned):
+    counts = _severity_counts(findings)
+    e = html.escape  # escape ALL interpolated values (no stored-XSS)
+    rows = []
+    for f in findings:
+        rows.append(
+            "<div class='card sev-%s'>"
+            "<div class='badge'>%s</div>"
+            "<h3>%s</h3>"
+            "<p class='meta'>Object: <code>%s</code> &middot; Line: %s &middot; "
+            "Finding: %s</p>"
+            "<p>%s</p>"
+            "<p class='rec'><strong>Recommendation:</strong> %s</p>"
+            "</div>" % (
+                e((f.get("severity") or "").lower()),
+                e(f.get("severity", "")),
+                e(f.get("issue_title", "")),
+                e(f.get("object_name", "")),
+                e(str(f.get("line_number", ""))),
+                e(f.get("finding_id", "")),
+                e(f.get("issue_description", "")),
+                e(f.get("recommendation", "")),
+            )
+        )
+    doc = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>RedRays ABAP Security Report</title>
+<style>
+body{{font-family:Segoe UI,Arial,sans-serif;margin:2rem;color:#1a1a1a}}
+h1{{color:#c0392b}}
+.summary{{background:#f6f6f6;padding:1rem;border-radius:6px}}
+.card{{border:1px solid #ddd;border-left:6px solid #999;padding:1rem;margin:1rem 0;border-radius:4px}}
+.card.sev-critical{{border-left-color:#c0392b}}
+.card.sev-high{{border-left-color:#e67e22}}
+.card.sev-medium{{border-left-color:#f1c40f}}
+.card.sev-low{{border-left-color:#3498db}}
+.card.sev-info{{border-left-color:#95a5a6}}
+.badge{{display:inline-block;font-weight:bold;font-size:.8rem}}
+code{{background:#eee;padding:0 .3rem}}
+</style></head><body>
+<h1>RedRays ABAP Security Report</h1>
+<div class="summary">
+<p>Scan ID: <code>{scan_id}</code></p>
+<p>Files Scanned: {files_scanned}</p>
+<p>Vulnerabilities Found: {vuln_count}</p>
+<p>CRITICAL: {c} &middot; HIGH: {h} &middot; MEDIUM: {m} &middot; LOW: {l} &middot; INFO: {i}</p>
+</div>
+{cards}
+</body></html>""".format(
+        scan_id=e(scan_id or ""),
+        files_scanned=files_scanned,
+        vuln_count=len(findings),
+        c=counts["CRITICAL"], h=counts["HIGH"], m=counts["MEDIUM"],
+        l=counts["LOW"], i=counts["INFO"],
+        cards="\n".join(rows) if rows
+        else "<p>No vulnerabilities found in the scanned files.</p>",
+    )
+    with open(out_file, "w", encoding="utf-8") as fh:
+        fh.write(doc)
 
-        all_vulnerabilities.extend(filtered_vulnerabilities)
 
-    return all_vulnerabilities
+def write_sarif_report(findings, out_file, scan_id, path_by_object=None):
+    """SARIF 2.1.0 for GitHub code scanning upload."""
+    path_by_object = path_by_object or {}
+    sarif_level = {  # SARIF has only error/warning/note
+        "CRITICAL": "error", "HIGH": "error",
+        "MEDIUM": "warning", "LOW": "note", "INFO": "note",
+    }
+    rules = {}
+    results = []
+    for f in findings:
+        rule_id = f.get("finding_id") or f.get("issue_type") or "redrays-finding"
+        if rule_id not in rules:
+            rules[rule_id] = {
+                "id": rule_id,
+                "name": (f.get("issue_type") or "RedRaysFinding").replace(" ", ""),
+                "shortDescription": {"text": f.get("issue_title") or rule_id},
+                "fullDescription": {"text": f.get("issue_description") or ""},
+                "helpUri": "https://redrays.io",
+                "properties": {"security-severity": _cvss_for(f.get("severity"))},
+            }
+        try:
+            line = int(str(f.get("line_number") or "1").strip() or "1")
+        except ValueError:
+            line = 1
+        # Point the annotation at the REAL scanned file (repo-relative POSIX path) so GitHub
+        # code-scanning attaches the alert to the actual source line, not a phantom "<name>.abap".
+        real_path = path_by_object.get(f.get("object_name"))
+        if real_path:
+            uri = real_path.replace("\\", "/")
+            if uri.startswith("./"):
+                uri = uri[2:]
+        else:
+            uri = (f.get("object_name") or "unknown") + ".abap"
+        results.append({
+            "ruleId": rule_id,
+            "level": sarif_level.get((f.get("severity") or "").upper(), "warning"),
+            "message": {"text": "%s: %s" % (
+                f.get("issue_title", ""), f.get("issue_description", ""))},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": uri},
+                    "region": {"startLine": max(line, 1)},
+                }
+            }],
+            "properties": {"severity": f.get("severity", ""),
+                           "scan_id": scan_id, "status": f.get("status", "")},
+        })
+    sarif = {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "RedRays ABAP Security Scanner",
+                "informationUri": "https://redrays.io",
+                "version": "2.0.0",
+                "rules": list(rules.values()),
+            }},
+            "results": results,
+        }],
+    }
+    with open(out_file, "w", encoding="utf-8") as fh:
+        json.dump(sarif, fh, indent=2)
 
+
+def _cvss_for(sev):
+    return {"CRITICAL": "9.5", "HIGH": "7.5", "MEDIUM": "5.0",
+            "LOW": "3.0", "INFO": "0.0"}.get((sev or "").upper(), "5.0")
+
+
+def _severity_counts(findings):
+    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    for f in findings:
+        sev = (f.get("severity") or "").upper()
+        if sev in counts:
+            counts[sev] += 1
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# GitHub output
+# ---------------------------------------------------------------------------
+
+def set_github_output(name, value):
+    out = os.environ.get("GITHUB_OUTPUT")
+    if not out:
+        return
+    with open(out, "a", encoding="utf-8") as fh:
+        fh.write("%s=%s\n" % (name, value))
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    """Main function to run the scanner"""
-    parser = argparse.ArgumentParser(description='RedRays ABAP Security Scanner')
-    parser.add_argument('--api-key', required=True, help='RedRays API key')
-    parser.add_argument('--api-url', default='https://api.redrays.io/api/scan', help='RedRays API URL')
-    parser.add_argument('--files', help='Comma-separated list of files to scan')
-    parser.add_argument('--scan-dir', help='Directory containing ABAP files to scan')
-    parser.add_argument('--output-format', default='html', choices=['csv', 'html', 'json'], help='Report output format')
-    parser.add_argument('--output-file', help='Report output file path')
-    parser.add_argument('--threshold',
-                        choices=['critical', 'high', 'medium', 'low', 'informational'],
-                        help='Severity threshold for failing the build (critical, high, medium, low, informational)')
-    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-
+    parser = argparse.ArgumentParser(
+        description="RedRays ABAP Security Scanner (MC /agent/v1 client)")
+    # NOTE: token is intentionally NOT a CLI arg. It is read from REDRAYS_TOKEN.
+    parser.add_argument("--api-url", default=DEFAULT_API_BASE,
+                        help="MC /agent/v1 base URL")
+    parser.add_argument("--scan-dir", default=".")
+    parser.add_argument("--files", default="")
+    parser.add_argument("--output-format", default="html",
+                        choices=["csv", "html", "json", "sarif"])
+    parser.add_argument("--output-file", default="")
+    parser.add_argument("--fail-on-vulnerabilities", default="true")
+    parser.add_argument("--threshold", default="",
+                        help="critical|high|medium|low|informational")
+    parser.add_argument("--scan-profile", default="CRITICAL_HIGH",
+                        help="QUICK|FULL|CRITICAL|CRITICAL_HIGH")
     args = parser.parse_args()
 
-    # Set debug logging if requested
-    if args.debug:
-        logger.setLevel(logging.DEBUG)
-        logger.debug("Debug logging enabled")
+    token = os.environ.get("REDRAYS_TOKEN", "").strip()
+    if not token:
+        print("ERROR: REDRAYS_TOKEN environment variable is not set.", file=sys.stderr)
+        sys.exit(2)
 
-    # Initialize scanner
-    scanner = RedRaysScanner(args.api_key, args.api_url)
+    base = args.api_url.rstrip("/")
+    out_file = args.output_file.strip()
+    if not out_file:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ext = "html" if args.output_format == "html" else args.output_format
+        out_file = "redrays_scan_report_%s.%s" % (stamp, ext)
 
-    # Determine output file if not specified
-    if not args.output_file:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output_file = f"redrays_scan_report_{timestamp}.{args.output_format}"
+    try:
+        # 1. Verify token (GET /me)
+        dev = verify_token(base, token)
+        print("Authenticated as: %s" % dev)
 
-    # Initialize scan results list
-    scan_results = []
+        # 2. Collect ABAP source
+        programs = collect_programs(args.files, args.scan_dir)
+        if not programs:
+            print("No .abap files found to scan.")
+            _emit_empty(out_file, args, dev_scan_id="")
+            sys.exit(0)
+        if len(programs) > MAX_BATCH:
+            print("ERROR: %d objects exceed contract batch max of %d. "
+                  "Split the scan into multiple runs." % (len(programs), MAX_BATCH),
+                  file=sys.stderr)
+            sys.exit(2)
 
-    # If specific files are provided via --files argument
-    if args.files:
-        logger.info(f"Manual file scanning mode detected")
-        file_paths = [f.strip() for f in args.files.split(',')]
+        submit_programs = [
+            {k: v for k, v in p.items() if not k.startswith("_")} for p in programs
+        ]
+        print("Submitting %d ABAP object(s) (profile=%s)..."
+              % (len(submit_programs), args.scan_profile))
 
-        for file_path in file_paths:
-            if not file_path.lower().endswith('.abap'):
-                logger.warning(f"Skipping non-ABAP file: {file_path}")
-                continue
+        # 3. Submit batch (POST /scan-batch)
+        scan_id = submit_batch(base, token, submit_programs, args.scan_profile)
+        print("Scan submitted. scan_id=%s" % scan_id)
 
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    code = f.read()
+        # 4. Poll (GET /scan-result/{scanId})
+        poll_result(base, token, scan_id)
 
-                logger.info(f"[Files] Scanning file: {file_path}")
-                result = scanner.scan_code(code, file_path)
+        # 5. Collect findings (GET /findings?scan_id=)
+        findings = get_findings(base, token, scan_id)
+        print("Scan COMPLETED. %d finding(s)." % len(findings))
 
-                # Format the result for reporting
-                formatted_result = {
-                    "file_path": file_path,
-                    "scan_guid": result.get("data", {}).get("scan_guid", "") if result.get("data") else "",
-                    "vulnerabilities": []
-                }
+    except ScanError as ex:
+        print("ERROR: %s" % ex, file=sys.stderr)
+        sys.exit(2)
 
-                # Extract vulnerabilities from the scan result
-                if "data" in result and result.get("data"):
-                    scan_result = result["data"].get("scan_result", [])
-
-                    # If scan_result is a string (JSON), parse it
-                    if isinstance(scan_result, str):
-                        try:
-                            scan_result = json.loads(scan_result)
-                        except json.JSONDecodeError:
-                            scan_result = []
-
-                    formatted_result["vulnerabilities"] = scan_result
-                    formatted_result["scan_result"] = scan_result
-                elif "scan_result" in result:
-                    # For error cases where we've embedded scan_result directly
-                    formatted_result["vulnerabilities"] = result["scan_result"]
-                    formatted_result["scan_result"] = result["scan_result"]
-
-                scan_results.append(formatted_result)
-
-            except Exception as e:
-                logger.error(f"Error processing file {file_path}: {str(e)}")
-
-    # If a directory is provided via --scan-dir argument
-    elif args.scan_dir:
-        logger.info(f"Directory scanning mode detected: {args.scan_dir}")
-
-        if not os.path.isdir(args.scan_dir):
-            logger.error(f"Directory not found: {args.scan_dir}")
-            sys.exit(1)
-
-        # Find all ABAP files in the directory
-        abap_files = find_abap_files(args.scan_dir)
-
-        logger.info(f"Found {len(abap_files)} ABAP files to scan")
-
-        for file_path in abap_files:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    code = f.read()
-
-                logger.info(f"[ScanDir] Scanning file: {file_path}")
-                result = scanner.scan_code(code, file_path)
-
-                # Format the result for reporting
-                formatted_result = {
-                    "file_path": file_path,
-                    "scan_guid": result.get("data", {}).get("scan_guid", "") if result.get("data") else "",
-                    "vulnerabilities": []
-                }
-
-                # Extract vulnerabilities from the scan result
-                if "data" in result and result.get("data"):
-                    scan_result = result["data"].get("scan_result", [])
-
-                    # If scan_result is a string (JSON), parse it
-                    if isinstance(scan_result, str):
-                        try:
-                            scan_result = json.loads(scan_result)
-                        except json.JSONDecodeError:
-                            scan_result = []
-
-                    formatted_result["vulnerabilities"] = scan_result
-                    formatted_result["scan_result"] = scan_result
-                elif "scan_result" in result:
-                    # For error cases where we've embedded scan_result directly
-                    formatted_result["vulnerabilities"] = result["scan_result"]
-                    formatted_result["scan_result"] = result["scan_result"]
-
-                scan_results.append(formatted_result)
-
-            except Exception as e:
-                logger.error(f"Error processing file {file_path}: {str(e)}")
-
+    # 6. Write report
+    # object_name -> real local path, so SARIF annotations land on the actual repo file.
+    path_by_object = {p["objectName"]: p["_path"] for p in programs}
+    fmt = args.output_format
+    if fmt == "json":
+        write_json_report(findings, out_file, scan_id, len(programs))
+    elif fmt == "csv":
+        write_csv_report(findings, out_file)
+    elif fmt == "sarif":
+        write_sarif_report(findings, out_file, scan_id, path_by_object)
     else:
-        logger.error("No scan mode specified. Please use --files or --scan-dir.")
-        parser.print_help()
+        write_html_report(findings, out_file, scan_id, len(programs))
+    print("Report written to %s" % out_file)
+
+    # 7. Gate
+    vuln_count = len(findings)
+    breached = threshold_breached(findings, args.threshold)
+    fail_on_vulns = str(args.fail_on_vulnerabilities).lower() == "true"
+
+    # Consolidated exit logic (single owner: this script)
+    if args.threshold:
+        should_fail = breached
+    else:
+        should_fail = fail_on_vulns and vuln_count > 0
+        breached = should_fail  # report the effective gate result
+
+    # 8. GitHub outputs
+    set_github_output("report-path", out_file)
+    set_github_output("vulnerabilities-found", str(vuln_count))
+    set_github_output("threshold-breached", "true" if breached else "false")
+    set_github_output("scan-id", scan_id)
+
+    counts = _severity_counts(findings)
+    print("Summary: total=%d CRITICAL=%d HIGH=%d MEDIUM=%d LOW=%d INFO=%d" % (
+        vuln_count, counts["CRITICAL"], counts["HIGH"],
+        counts["MEDIUM"], counts["LOW"], counts["INFO"]))
+
+    if should_fail:
+        reason = ("threshold '%s' breached" % args.threshold
+                  if args.threshold else "vulnerabilities found")
+        print("::error::RedRays scan gate failed: %s" % reason)
         sys.exit(1)
 
-    # No files scanned - now displays a warning instead of an error
-    if not scan_results:
-        logger.warning("No files were scanned. No report will be generated.")
-        sys.exit(0)  # Exit with success code instead of error
+    if args.threshold and vuln_count > 0:
+        print("::warning::%d vulnerability(ies) found but below threshold '%s'."
+              % (vuln_count, args.threshold))
+    sys.exit(0)
 
-    # Generate report
-    logger.info(f"Generating {args.output_format} report: {args.output_file}")
-    report_path = ReportGenerator.generate_report(
-        scan_results, args.output_format, args.output_file
-    )
 
-    # Extract all vulnerabilities for threshold checking
-    all_vulnerabilities = extract_all_vulnerabilities(scan_results)
-    vulnerability_count = len(all_vulnerabilities)
-
-    # Check if threshold is breached
-    threshold_breached = args.threshold and check_threshold_breach(all_vulnerabilities, args.threshold)
-
-    if vulnerability_count > 0:
-        if threshold_breached:
-            logger.error(
-                f"Vulnerability(ies) have been found with {args.threshold} or higher severity. See report at: {report_path}")
-            sys.exit(1)  # Exit with error if threshold is breached
-        else:
-            if args.threshold:
-                pass
-                logger.warning(
-                    f"Vulnerability(ies) have been found, but none exceed the {args.threshold} threshold. See report at: {report_path}")
-            else:
-                logger.warning(f"Vulnerability(ies) have been found. See report at: {report_path}")
-            sys.exit(0)  # Permit build to continue if no threshold breach
+def _emit_empty(out_file, args, dev_scan_id):
+    fmt = args.output_format
+    if fmt == "json":
+        write_json_report([], out_file, dev_scan_id, 0)
+    elif fmt == "csv":
+        write_csv_report([], out_file)
+    elif fmt == "sarif":
+        write_sarif_report([], out_file, dev_scan_id)
     else:
-        logger.info("No vulnerabilities found in the scanned files.")
-        sys.exit(0)
+        write_html_report([], out_file, dev_scan_id, 0)
+    set_github_output("report-path", out_file)
+    set_github_output("vulnerabilities-found", "0")
+    set_github_output("threshold-breached", "false")
+    set_github_output("scan-id", dev_scan_id)
 
 
 if __name__ == "__main__":
